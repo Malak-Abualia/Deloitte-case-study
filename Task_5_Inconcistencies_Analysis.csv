@@ -1,0 +1,5 @@
+Inconsistency Type,Impact on Business,Severity,Count of Affected Rows,How It Was Handled,SME Action Required,Comments / Next Steps
+Mixed Date Formats,Orders not loaded because dates couldn’t be parsed,High,7,Unified using regex + multi-pattern parsing,No,"Already standardized, only new formats need SME approval"
+Zero or Negative Sales/Qty,Wrong revenue & order volumes if loaded,High,10620,Quarantined automatically,Yes,Confirm if negative/zero values represent returns/cancellations
+Categorical Inconsistency,"Country/Region mismatch (e.g., NA, n/a, whitespace)",Medium,115,Trim + Initcap + NA normalization,Yes,Provide official master list for regions/countries
+Duplicate Order Lines,Inflated sales/profit if duplicates loaded,High,6695,Quarantined pending business rules,Yes,Decide deduplication logic (keep latest vs sum quantities)

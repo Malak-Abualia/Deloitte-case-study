@@ -1,0 +1,7 @@
+data_mart_system_name,count_rows,count_distinct_primary_key,count_distinct_row_id
+fact_sales,26133,5007,26133
+dim_customer,793,793,
+dim_geography,632,632,
+dim_product,1889,1889,
+dim_shipmode,4,4,
+dim_date,1435,1435,

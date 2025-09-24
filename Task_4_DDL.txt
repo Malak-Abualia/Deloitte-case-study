@@ -1,0 +1,456 @@
+-- ======================================================
+-- SCHEMA CREATION
+-- ======================================================
+CREATE SCHEMA IF NOT EXISTS raw;
+CREATE SCHEMA IF NOT EXISTS stg;
+CREATE SCHEMA IF NOT EXISTS core;
+CREATE SCHEMA IF NOT EXISTS audit;
+CREATE SCHEMA IF NOT EXISTS marts;
+CREATE SCHEMA IF NOT EXISTS mdm;
+
+-- ======================================================
+-- RAW LAYER
+-- ======================================================
+-- Table: raw.orders_file
+
+-- DROP TABLE IF EXISTS "raw".orders_file;
+
+CREATE TABLE IF NOT EXISTS "raw".orders_file
+(
+    row_id text COLLATE pg_catalog."default",
+    order_id text COLLATE pg_catalog."default",
+    product_id text COLLATE pg_catalog."default",
+    product_name text COLLATE pg_catalog."default",
+    sub_category text COLLATE pg_catalog."default",
+    category text COLLATE pg_catalog."default",
+    customer_id text COLLATE pg_catalog."default",
+    customer_name text COLLATE pg_catalog."default",
+    segment text COLLATE pg_catalog."default",
+    country text COLLATE pg_catalog."default",
+    state text COLLATE pg_catalog."default",
+    city text COLLATE pg_catalog."default",
+    postal_code text COLLATE pg_catalog."default",
+    region text COLLATE pg_catalog."default",
+    ship_mode text COLLATE pg_catalog."default",
+    order_date text COLLATE pg_catalog."default",
+    ship_date text COLLATE pg_catalog."default",
+    sales text COLLATE pg_catalog."default",
+    quantity text COLLATE pg_catalog."default",
+    discount text COLLATE pg_catalog."default",
+    profit text COLLATE pg_catalog."default",
+    source_file text COLLATE pg_catalog."default" NOT NULL,
+    source_file_dt timestamp without time zone,
+    load_ts timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS "raw".orders_file
+    OWNER to postgres;
+
+COMMENT ON TABLE "raw".orders_file
+    IS 'Landing table for monthly CSVs.';
+
+COMMENT ON COLUMN "raw".orders_file.source_file
+    IS 'Original ingested file name';
+
+COMMENT ON COLUMN "raw".orders_file.source_file_dt
+    IS 'Timestamp extracted from source file name';
+
+COMMENT ON COLUMN "raw".orders_file.load_ts
+    IS 'When the row was ingested into RAW';
+
+-- ======================================================
+-- STAGING LAYER
+-- ======================================================
+DROP TABLE IF EXISTS stg.Orders;
+
+CREATE TABLE stg.Orders
+(
+    row_id              INTEGER,         
+    order_id            VARCHAR(40),     
+    order_date          DATE,            
+    ship_date           DATE,            
+    ship_mode           VARCHAR(50),     
+    customer_id         VARCHAR(40),     
+    customer_name       VARCHAR(200),    
+    segment             VARCHAR(50),     
+    country             VARCHAR(100),    
+    city                VARCHAR(100),    
+    state               VARCHAR(100),    
+    postal_code         VARCHAR(20),     
+    region              VARCHAR(50),     
+    product_id          VARCHAR(40),     
+    category            VARCHAR(100),    
+    sub_category        VARCHAR(100),    
+    product_name        VARCHAR(255),    
+    sales       NUMERIC(12,2),   
+    quantity            INTEGER,         
+    discount            NUMERIC(5,4),    
+    profit              NUMERIC(12,2),   
+    load_ts             TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    batch_id            TEXT NOT NULL,
+    CONSTRAINT stg_Orders_chk_values
+        CHECK (quantity >= 0 AND sales_amount >= 0)
+);
+
+COMMENT ON COLUMN stg.Orders.row_id IS 'Row number in source files';
+COMMENT ON COLUMN stg.Orders.order_id IS 'Unique Order Id';
+COMMENT ON COLUMN stg.Orders.order_line_number IS 'Optional line number inside order';
+COMMENT ON COLUMN stg.Orders.order_date IS 'Order creation date by customer';
+COMMENT ON COLUMN stg.Orders.ship_date IS 'Order shipment date';
+COMMENT ON COLUMN stg.Orders.ship_mode IS 'Order priority type';
+COMMENT ON COLUMN stg.Orders.customer_id IS 'Unique Customer Id';
+COMMENT ON COLUMN stg.Orders.customer_name IS 'Customer Name';
+COMMENT ON COLUMN stg.Orders.segment IS 'Consumer Segment';
+COMMENT ON COLUMN stg.Orders.country IS 'Country of delivery';
+COMMENT ON COLUMN stg.Orders.city IS 'City of delivery';
+COMMENT ON COLUMN stg.Orders.state IS 'State of delivery';
+COMMENT ON COLUMN stg.Orders.postal_code IS 'Postal Code of delivery';
+COMMENT ON COLUMN stg.Orders.region IS 'Region of delivery';
+COMMENT ON COLUMN stg.Orders.product_id IS 'Unique Id of ordered product';
+COMMENT ON COLUMN stg.Orders.category IS 'Product category';
+COMMENT ON COLUMN stg.Orders.sub_category IS 'Product sub-category';
+COMMENT ON COLUMN stg.Orders.product_name IS 'Product name';
+COMMENT ON COLUMN stg.Orders.sales_amount IS 'Sales amount in USD';
+COMMENT ON COLUMN stg.Orders.quantity IS 'Quantity of product in order';
+COMMENT ON COLUMN stg.Orders.discount IS 'Discount applied on the order line';
+COMMENT ON COLUMN stg.Orders.profit IS 'Profit from delivery of the product';
+COMMENT ON COLUMN stg.Orders.load_ts IS 'Timestamp when row was ingested into staging';
+COMMENT ON COLUMN stg.Orders.batch_id IS 'Pipeline batch identifier for traceability';
+
+CREATE INDEX IF NOT EXISTS ix_stg_Orders_order_id
+    ON stg.Orders(order_id, order_line_number);
+
+
+DROP TABLE IF EXISTS stg.orders_quarantine;
+
+CREATE TABLE stg.orders_quarantine (
+  quarantine_id BIGSERIAL PRIMARY KEY,
+  dq_type       TEXT NOT NULL,       
+  file_name     TEXT,
+  source_row_id TEXT,
+  load_ts       TIMESTAMP NOT NULL DEFAULT now(),
+  review_status TEXT DEFAULT 'new'    
+);
+
+COMMENT ON TABLE stg.orders_quarantine IS 'Holds rows that failed data quality checks during staging.';
+
+
+-- ======================================================
+-- CORE LAYER
+-- ======================================================
+DROP TABLE IF EXISTS core.dim_date;
+
+CREATE TABLE core.dim_date
+(
+    date_sk      INTEGER PRIMARY KEY,   
+    full_date    DATE NOT NULL UNIQUE,
+    yyyymm       INTEGER NOT NULL,
+    year         SMALLINT NOT NULL,
+    month        SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
+    day          SMALLINT NOT NULL CHECK (day BETWEEN 1 AND 31),
+    is_month_end BOOLEAN NOT NULL,
+
+    load_ts      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    batch_id     TEXT NOT NULL
+);
+
+COMMENT ON TABLE core.dim_date IS 'Date dimension';
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_dim_date_yyyymm_day
+    ON core.dim_date(yyyymm, day);
+
+
+-- ======================================================
+-- AUDIT 
+-- ======================================================
+
+Drop table if exists audit.file_audit;
+CREATE TABLE audit.file_audit (
+  file_audit_id BIGSERIAL PRIMARY KEY,   
+  file_name     TEXT NOT NULL,           
+  loaded_rows   BIGINT NOT NULL,        
+  status        TEXT NOT NULL,           
+  started_at    TIMESTAMP NOT NULL 
+                 DEFAULT now(),          
+  ended_at      TIMESTAMP                
+);
+COMMENT ON TABLE  audit.file_audit IS 'Audit table for tracking file ingestion runs (ETL).';
+COMMENT ON COLUMN audit.file_audit.file_audit_id IS 'Unique identifier for the file load run.';
+COMMENT ON COLUMN audit.file_audit.file_name     IS 'Name of the ingested source file.';
+COMMENT ON COLUMN audit.file_audit.loaded_rows   IS 'Count of rows loaded from the file.';
+COMMENT ON COLUMN audit.file_audit.status        IS 'Load status: SUCCESS / FAILED / PARTIAL.';
+COMMENT ON COLUMN audit.file_audit.started_at    IS 'Timestamp when the load started.';
+COMMENT ON COLUMN audit.file_audit.ended_at      IS 'Timestamp when the load ended (nullable).';
+
+
+DROP TABLE IF EXISTS audit.pipeline_execution_audit;
+
+CREATE TABLE audit.pipeline_execution_audit (
+  run_id      BIGSERIAL PRIMARY KEY,
+  dag_name    TEXT NOT NULL,
+  run_status  TEXT NOT NULL,             
+  started_at  TIMESTAMP NOT NULL DEFAULT now(),
+  finished_at TIMESTAMP
+);
+
+COMMENT ON TABLE audit.pipeline_execution_audit IS 'Execution log for pipelines(status, timings).';
+----------------------------
+drop table if exists audit.file_audit cascade;
+CREATE TABLE audit.file_audit (
+  file_audit_id BIGSERIAL PRIMARY KEY,   
+  file_name     TEXT NOT NULL,           
+  loaded_rows   BIGINT NOT NULL,        
+  status        TEXT NOT NULL,           
+  started_at    TIMESTAMP NOT NULL 
+                 DEFAULT now(),          
+  ended_at      TIMESTAMP                
+);
+COMMENT ON TABLE  audit.file_audit IS 'Audit table for tracking file ingestion runs (ETL).';
+COMMENT ON COLUMN audit.file_audit.file_audit_id IS 'Unique identifier for the file load run.';
+COMMENT ON COLUMN audit.file_audit.file_name     IS 'Name of the ingested source file.';
+COMMENT ON COLUMN audit.file_audit.loaded_rows   IS 'Count of rows loaded from the file.';
+COMMENT ON COLUMN audit.file_audit.status        IS 'Load status: SUCCESS / FAILED / PARTIAL.';
+COMMENT ON COLUMN audit.file_audit.started_at    IS 'Timestamp when the load started.';
+COMMENT ON COLUMN audit.file_audit.ended_at      IS 'Timestamp when the load ended (nullable).';
+------------------
+
+
+DROP TABLE IF EXISTS audit.table_audit;
+
+CREATE TABLE audit.table_audit (
+  table_audit_id BIGSERIAL PRIMARY KEY,
+  run_id         BIGINT REFERENCES audit.pipeline_execution_audit(run_id),--fk
+  file_audit_id  BIGINT REFERENCES audit.file_audit(file_audit_id),--fk
+  schema_name    TEXT NOT NULL,
+  table_name     TEXT NOT NULL,
+  rows_in        BIGINT,
+  rows_out       BIGINT,
+  status         TEXT NOT NULL,             
+  started_at     TIMESTAMP NOT NULL DEFAULT now(),
+  ended_at       TIMESTAMP
+);
+
+COMMENT ON TABLE audit.table_audit IS 'Auditing log at table-level (row counts, status, linked to pipeline runs and files).';
+COMMENT ON COLUMN audit.table_audit.rows_in  IS 'Number of rows extracted/read from source';
+COMMENT ON COLUMN audit.table_audit.rows_out IS 'Number of rows successfully written to target';
+
+
+-- ======================================================
+-- MDM LAYER
+-- ======================================================
+
+DROP TABLE IF EXISTS mdm.customers_master CASCADE;
+CREATE TABLE mdm.customers_master (
+    customer_id    BIGSERIAL PRIMARY KEY,        -- surrogate key (golden ID)
+    customer_name  TEXT NOT NULL,
+    segment        TEXT,
+    record_status  VARCHAR(20) DEFAULT 'ACTIVE', -- Active/Inactive
+    created_at     TIMESTAMP DEFAULT now(),
+    updated_at     TIMESTAMP DEFAULT now()
+);
+
+
+
+DROP TABLE IF EXISTS mdm.products_master CASCADE;
+
+CREATE TABLE mdm.products_master (
+    product_id         BIGSERIAL PRIMARY KEY,        -- surrogate key (golden ID)
+    product_name       TEXT NOT NULL,
+    product_category   TEXT,
+    product_subcategory TEXT,
+    created_at         TIMESTAMP DEFAULT now(),
+    updated_at         TIMESTAMP DEFAULT now()
+);
+
+
+
+drop table core.Dim_Date cascade;
+CREATE TABLE core.Dim_Date (
+    Date_SK SERIAL PRIMARY KEY,       
+    full_date DATE UNIQUE NOT NULL, 
+    yyyymm INT,                           
+    year INT,
+    quarter INT,
+    month INT,
+    day INT,
+    is_month_end BOOLEAN                 
+); 
+INSERT INTO  core.dim_date  (full_date, yyyymm, year, quarter, month, day, is_month_end)
+SELECT DISTINCT
+    d::DATE AS full_date,
+    TO_CHAR(d::DATE, 'YYYYMM')::INT AS yyyymm,
+    EXTRACT(YEAR FROM d)::INT AS year,
+    EXTRACT(QUARTER FROM d)::INT AS quarter,
+    EXTRACT(MONTH FROM d)::INT AS month,
+    EXTRACT(DAY FROM d)::INT AS day,
+    CASE 
+        WHEN d = (DATE_TRUNC('MONTH', d) + INTERVAL '1 MONTH - 1 day')::DATE THEN TRUE
+        ELSE FALSE
+    END AS is_month_end
+FROM (
+    SELECT order_date AS d FROM stg.orders WHERE order_date IS NOT NULL
+    UNION
+    SELECT ship_date AS d FROM stg.orders WHERE ship_date IS NOT NULL
+) x
+
+
+
+
+-----------------------------------------------------
+--------------------------------------------------
+-- Table: core.fact_order_sales
+
+ DROP TABLE IF EXISTS core.fact_order_sales;
+
+CREATE TABLE IF NOT EXISTS core.fact_order_sales
+(
+    order_line_sk bigint NOT NULL GENERATED ALWAYS AS IDENTITY ( INCREMENT 1 START 1 MINVALUE 1 MAXVALUE 9223372036854775807 CACHE 1 ),
+    order_id character varying(40) COLLATE pg_catalog."default" NOT NULL,
+    product_sk bigint NOT NULL,
+    customer_sk bigint NOT NULL,
+    geo_sk bigint NOT NULL,
+    shipmode_sk bigint NOT NULL,
+    order_date_sk integer NOT NULL,
+    ship_date_sk integer,
+    sales numeric(12,2) NOT NULL,
+    quantity integer NOT NULL,
+    discount numeric(5,4) NOT NULL,
+    profit numeric(12,2) NOT NULL,
+    delivery_days integer,
+    avg_price numeric(12,4),
+    profit_margin numeric(7,4),
+    load_ts timestamp without time zone NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fact_order_sales_pkey PRIMARY KEY (order_line_sk),
+    CONSTRAINT fact_order_sales_customer_sk_fkey FOREIGN KEY (customer_sk)
+        REFERENCES core.dim_customer (customer_sk) MATCH SIMPLE
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+    CONSTRAINT fact_order_sales_geo_sk_fkey FOREIGN KEY (geo_sk)
+        REFERENCES core.dim_geography (geo_sk) MATCH SIMPLE
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+    CONSTRAINT fact_order_sales_product_sk_fkey FOREIGN KEY (product_sk)
+        REFERENCES core.dim_product (product_sk) MATCH SIMPLE
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+    CONSTRAINT fact_order_sales_shipmode_sk_fkey FOREIGN KEY (shipmode_sk)
+        REFERENCES core.dim_shipmode (shipmode_sk) MATCH SIMPLE
+        ON UPDATE RESTRICT
+        ON DELETE RESTRICT,
+    CONSTRAINT fact_order_sales_discount_check CHECK (discount >= 0::numeric AND discount <= 1::numeric),
+    CONSTRAINT fact_order_sales_quantity_check CHECK (quantity >= 0),
+    CONSTRAINT fact_order_sales_sales_amount_check CHECK (sales >= 0::numeric)
+)
+
+TABLESPACE pg_default;
+
+ALTER TABLE IF EXISTS core.fact_order_sales
+    OWNER to postgres;
+-- Index: ix_fact_order_sales_dates
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_dates;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_dates
+    ON core.fact_order_sales USING btree
+    (order_date_sk ASC NULLS LAST, ship_date_sk ASC NULLS LAST)
+    TABLESPACE pg_default;
+-- Index: ix_fact_order_sales_fk_customer
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_fk_customer;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_fk_customer
+    ON core.fact_order_sales USING btree
+    (customer_sk ASC NULLS LAST)
+    TABLESPACE pg_default;
+-- Index: ix_fact_order_sales_fk_geo
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_fk_geo;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_fk_geo
+    ON core.fact_order_sales USING btree
+    (geo_sk ASC NULLS LAST)
+    TABLESPACE pg_default;
+-- Index: ix_fact_order_sales_fk_product
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_fk_product;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_fk_product
+    ON core.fact_order_sales USING btree
+    (product_sk ASC NULLS LAST)
+    TABLESPACE pg_default;
+-- Index: ix_fact_order_sales_fk_shipmode
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_fk_shipmode;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_fk_shipmode
+    ON core.fact_order_sales USING btree
+    (shipmode_sk ASC NULLS LAST)
+    TABLESPACE pg_default;
+-- Index: ix_fact_order_sales_order
+
+-- DROP INDEX IF EXISTS core.ix_fact_order_sales_order;
+
+CREATE INDEX IF NOT EXISTS ix_fact_order_sales_order
+    ON core.fact_order_sales USING btree
+    (order_id COLLATE pg_catalog."default" ASC NULLS LAST)
+    TABLESPACE pg_default;
+
+
+----------------------------------------------
+---------------------------------------------
+	       ---Marts
+
+-------------------------------------------------
+------------------------------------------------
+-- Product
+CREATE TABLE IF NOT EXISTS marts.dim_product (
+  product_sk     BIGINT PRIMARY KEY,
+  product_id     VARCHAR(40) UNIQUE NOT NULL,
+  product_name   VARCHAR(255),
+  sub_category   VARCHAR(100),
+  category       VARCHAR(100),
+  load_ts        TIMESTAMP
+);
+
+-- Customer
+CREATE TABLE IF NOT EXISTS marts.dim_customer (
+  customer_sk    BIGINT PRIMARY KEY,
+  customer_id    VARCHAR(40) UNIQUE NOT NULL,
+  customer_name  VARCHAR(200),
+  segment        VARCHAR(50),
+  load_ts        TIMESTAMP
+);
+
+-- Geography
+CREATE TABLE IF NOT EXISTS marts.dim_geography (
+  geo_sk     BIGINT PRIMARY KEY,
+  country    VARCHAR(100),
+  state      VARCHAR(100),
+  city       VARCHAR(100),
+  postal_code VARCHAR(20),
+  region     VARCHAR(50),
+  load_ts    TIMESTAMP
+);
+
+-- Ship Mode
+CREATE TABLE IF NOT EXISTS marts.dim_shipmode (
+  shipmode_sk BIGINT PRIMARY KEY,
+  ship_mode   VARCHAR(50) UNIQUE NOT NULL,
+  load_ts     TIMESTAMP
+);
+
+--date
+CREATE TABLE marts.dim_date (
+    date_sk      SERIAL PRIMARY KEY,         
+    full_date    DATE NOT NULL UNIQUE,        
+    yyyymm       INTEGER NOT NULL,            
+    year         INTEGER NOT NULL,
+    quarter      INTEGER NOT NULL,            
+    month        INTEGER NOT NULL,           
+    day          INTEGER NOT NULL,            
+    is_month_end BOOLEAN NOT NULL
+);
+-----------------------------------------------------
+---------------------------------------------------

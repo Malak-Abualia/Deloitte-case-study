@@ -1,0 +1,6 @@
+KPI,Description,Formula,Granularity
+Avg Price Dynamics,Average sales price trend of best-selling products,AVG(Sales/Quantity) filtered for top-selling products,"Month, Product"
+Sales by State,Monthly sales trends per state,"SUM(Sales) GROUP BY State, Month","Month, State"
+Best Customers,Top customers by segment,"SUM(Sales) GROUP BY Customer, Segment","Month, Segment, Customer"
+Top/Bottom Products by Sales,Highest/lowest selling products per state,SUM(Sales) with Rank (Top/Bottom),"Month, State, Product"
+Top/Bottom Products by Delivery Time,Fastest/slowest delivered products per state,"AVG(DATEDIFF(day, Order Date, Ship Date))","Month, State, Product"
