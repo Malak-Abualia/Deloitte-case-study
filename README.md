@@ -36,7 +36,7 @@ psql -h localhost -U postgres -d retail_orders -f ddl/01_create_schemas_and_tabl
 
 This creates:
 - Schemas: `raw`, `stg`, `core`, `audit`, `marts`, `mdm`.
-- Staging table `stg.orders` with basic checks and audit columns (`load_ts`, `batch_id`).
+- Staging table `stg.orders` with basic checks and audit columns (`load_ts`).
 - Quarantine table `stg.orders_quarantine` for failed DQ rows.
 - Core `core.dim_date` and `core.fact_order_sales` with constraints and indexes.
 - Audit tables: `audit.pipeline_execution_audit`, `audit.file_audit`, `audit.table_audit` to track runs and row counts.
