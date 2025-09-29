@@ -1,0 +1,205 @@
+import os
+from pathlib import Path
+from datetime import datetime
+import hashlib
+from uuid import uuid4
+
+import chardet
+import pandas as pd
+from sqlalchemy import create_engine, text
+
+# ======================================================
+# 1) DB connection (env var with safe default)
+#    Example PG_DSN:
+#    postgresql+psycopg2://user:pass@host:5432/dbname
+# ======================================================
+dsn = os.getenv(
+    "PG_DSN",
+    "postgresql+psycopg2://postgres:malak@localhost:5432/retail_orders"
+)
+engine = create_engine(dsn)
+
+# ======================================================
+# 2) Ensure audit schema/table/index exist (idempotent DDL)
+# ======================================================
+with engine.begin() as conn:
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS audit;"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS audit.file_audit (
+          file_audit_id BIGSERIAL PRIMARY KEY,
+          file_name     TEXT NOT NULL,
+          file_sha256   TEXT NOT NULL,
+          loaded_rows   BIGINT NOT NULL,
+          status        TEXT NOT NULL,          -- 'OK' / 'SKIPPED' / 'ERROR'
+          batch_id      TEXT NOT NULL,
+          started_at    TIMESTAMP NOT NULL DEFAULT now(),
+          ended_at      TIMESTAMP
+        );
+    """))
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_file_sha256
+        ON audit.file_audit(file_sha256);
+    """))
+
+# ======================================================
+# 3) Input folder & columns mapping
+# ======================================================
+MY_Path = Path(
+    r"C:\Users\MalakAbuAlia\Downloads\D\Data Modernization\Data Modernization\Case_Study_202309_Data\Case_Study_Data_For_Share"
+)
+
+MY_Cols = {
+    "Row ID": "row_id",
+    "Order ID": "order_id",
+    "Order Date": "order_date",
+    "Ship Date": "ship_date",
+    "Ship Mode": "ship_mode",
+    "Customer ID": "customer_id",
+    "Customer Name": "customer_name",
+    "Segment": "segment",
+    "Country": "country",
+    "City": "city",
+    "State": "state",
+    "Postal Code": "postal_code",
+    "Region": "region",
+    "Product ID": "product_id",
+    "Category": "category",
+    "Sub-Category": "sub_category",
+    "Product Name": "product_name",
+    "Sales": "sales",
+    "Quantity": "quantity",
+    "Discount": "discount",
+    "Profit": "profit",
+}
+
+# ======================================================
+# 4) Batch ID (same for all files in this run)
+# ======================================================
+BATCH_ID = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + str(uuid4())[:8]
+
+# ======================================================
+# 5) Helpers
+# ======================================================
+def detect_encoding(path: Path, sample_bytes: int = 100_000) -> str:
+    with open(path, "rb") as f:
+        raw = f.read(sample_bytes)
+    enc = chardet.detect(raw).get("encoding")
+    return enc or "utf-8"
+
+def file_sha256(path: Path, chunk=1024*1024) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+def already_loaded_ok(checksum: str) -> bool:
+    """True if this file (by checksum) is already recorded with status='OK'."""
+    with engine.begin() as conn:
+        r = conn.execute(
+            text("SELECT 1 FROM audit.file_audit WHERE file_sha256=:c AND status='OK'"),
+            {"c": checksum}
+        ).fetchone()
+        return r is not None
+
+# ======================================================
+# 6) Loader for a single CSV (with audit upsert logic)
+# ======================================================
+def load_one_csv(path: Path) -> int:
+    print(f"file Processing {path}")
+
+    chksum = file_sha256(path)
+
+    # If previously loaded OK -> mark SKIPPED for this batch (without downgrading OK)
+    if already_loaded_ok(chksum):
+        with engine.begin() as conn:
+            conn.execute(text("""
+              INSERT INTO audit.file_audit (file_name, file_sha256, loaded_rows, status, batch_id, ended_at)
+              VALUES (:f, :c, 0, 'SKIPPED', :b, now())
+              ON CONFLICT (file_sha256) DO UPDATE
+                SET
+                  status    = CASE WHEN audit.file_audit.status = 'OK' THEN 'OK' ELSE 'SKIPPED' END,
+                  batch_id  = :b,
+                  ended_at  = now()
+            """), {"f": path.name, "c": chksum, "b": BATCH_ID})
+        print(f"[SKIP] {path.name} already ingested (checksum match)")
+        return 0
+
+    try:
+        enc = detect_encoding(path)
+        df = pd.read_csv(
+            path,
+            sep="|",
+            header=0,
+            encoding=enc,
+            quotechar='"',
+            doublequote=True,
+        )
+
+        # Clean/rename headers
+        df.rename(columns=lambda c: c.strip().replace(",,,", ""), inplace=True)
+        df.rename(columns=MY_Cols, inplace=True)
+
+        # Audit cols in raw
+        df["source_file"] = path.name
+        df["source_file_dt"] = datetime.now()
+        df["batch_id"] = BATCH_ID
+
+        # Land into raw schema (append-only by design)
+        df.to_sql(
+            "malak",
+            con=engine,
+            schema="raw",
+            if_exists="append",
+            index=False,
+            chunksize=1000,
+            method="multi",
+        )
+
+        rows = len(df)
+        print(f"[OK] {path.name} loaded into raw.malak ({rows} rows)")
+
+        # Record OK (upsert)
+        with engine.begin() as conn:
+            conn.execute(text("""
+              INSERT INTO audit.file_audit (file_name, file_sha256, loaded_rows, status, batch_id, ended_at)
+              VALUES (:f, :c, :n, 'OK', :b, now())
+              ON CONFLICT (file_sha256) DO UPDATE
+                SET
+                  status      = 'OK',
+                  loaded_rows = :n,
+                  batch_id    = :b,
+                  ended_at    = now()
+            """), {"f": path.name, "c": chksum, "n": rows, "b": BATCH_ID})
+
+        return rows
+
+    except Exception as e:
+        print(f"[ERROR] Failed on {path.name}: {e}")
+        # Record ERROR (without downgrading a previous OK)
+        with engine.begin() as conn:
+            conn.execute(text("""
+              INSERT INTO audit.file_audit (file_name, file_sha256, loaded_rows, status, batch_id, ended_at)
+              VALUES (:f, :c, 0, 'ERROR', :b, now())
+              ON CONFLICT (file_sha256) DO UPDATE
+                SET
+                  status    = CASE WHEN audit.file_audit.status = 'OK' THEN 'OK' ELSE 'ERROR' END,
+                  batch_id  = :b,
+                  ended_at  = now()
+            """), {"f": path.name, "c": chksum, "b": BATCH_ID})
+        return 0
+
+# ======================================================
+# 7) Main loop
+# ======================================================
+def main():
+    total_rows = 0
+    for csv_path in sorted(MY_Path.glob("*.csv")):
+        total_rows += load_one_csv(csv_path)
+    print(f"[DONE] Batch {BATCH_ID} → Total rows loaded: {total_rows}")
+
+if __name__ == "__main__":
+    main()
